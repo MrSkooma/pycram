@@ -5,18 +5,21 @@ from scipy.spatial.transform import Rotation
 from pycram.datastructures.pose import Pose, Vector3, Quaternion, GraspPose
 from pycram.datastructures.grasp import GraspDescription
 from pycram.datastructures.enums import ApproachDirection, VerticalAlignment, Arms
+from pycram.external_interfaces.ik import try_to_reach_with_grasp
 
 class GraspClassifier:
     """Classifies and manages grasps from YAML data structure"""
 
-    def __init__(self, grasp_data: Dict):
+    def __init__(self, grasp_data: Dict, robot=None):
         """
         Initialize with grasp data dictionary
 
         Args:
             grasp_data: Dictionary containing 'grasps' key with grasp definitions
+            robot: Optional robot instance for reachability validation
         """
         self.grasp_data = grasp_data
+        self.robot = robot
         self.classified_grasps = self._classify_grasps()
 
     def _classify_grasps(self) -> Dict[ApproachDirection, List[Dict]]:
@@ -81,52 +84,16 @@ class GraspClassifier:
         elif up_vector[2] <= -0.5:
             return VerticalAlignment.BOTTOM
 
-    def get_grasp_pose(self,
-                               directions: Union[ApproachDirection, List[ApproachDirection]],
-                               vertical_alignment: Optional[VerticalAlignment] = None,
-                               arm: Arms = Arms.RIGHT) -> list[Any] | GraspPose:
-        """
-        Get GraspDescription objects for specified directions
+    def validate_grasp_reachability(self, pose: Pose, arm: Arms) -> bool:
+        """Check if grasp pose is kinematically reachable"""
+        if not self.robot:
+            return False
 
-        Args:
-            directions: Single direction or list of directions
-            vertical_alignment: Optional vertical alignment filter
-            max_grasps: Maximum number of grasps to return
-
-        Returns:
-            List of GraspDescription objects sorted by score
-        """
-        if isinstance(directions, ApproachDirection):
-            directions = [directions]
-
-        # Combine grasps from all requested directions
-        combined_grasps = []
-        for direction in directions:
-            grasps = self.classified_grasps.get(direction, [])
-
-            if vertical_alignment:
-                grasps = [g for g in grasps if g['vertical_alignment'] == vertical_alignment]
-
-            combined_grasps.extend(grasps)
-        if not combined_grasps:
-            return []
-        # Sort by score (highest first)
-        combined_grasps.sort(key=lambda x: x['score'], reverse=True)
-        best_grasp = combined_grasps[0]
-
-        # Create GraspDescription
-        grasp_description = GraspDescription(
-            approach_direction=best_grasp['approach_direction'],
-            vertical_alignment=best_grasp['vertical_alignment']
+        gripper_name = "r_gripper_tool_frame" if arm == Arms.RIGHT else "l_gripper_tool_frame"
+        result_pose = try_to_reach_with_grasp(
+            pose, self.robot, gripper_name, pose.orientation
         )
-
-        # Return PyCRAM's GraspPose object
-        return GraspPose(
-            pose=best_grasp['pose'],
-            header=best_grasp['pose'].header if hasattr(best_grasp['pose'], 'header') else None,
-            arm=arm,
-            grasp_description=grasp_description
-        )
+        return result_pose is not None
 
     def get_grasp_with_pose(self,
                            directions: Union[ApproachDirection, List[ApproachDirection]],
@@ -164,13 +131,73 @@ class GraspClassifier:
             'id': best_grasp['id']
         }
 
-    def get_best_grasp_description(self,
-                                   directions: Union[ApproachDirection, List[ApproachDirection]],
-                                   vertical_alignment: Optional[VerticalAlignment] = None) -> Optional[
-        GraspDescription]:
-        """Get the best single grasp description"""
-        grasps = self.get_grasp_descriptions(directions, vertical_alignment, max_grasps=1)
-        return grasps[0] if grasps else None
+    def get_n_best_reachable_grasps(self,
+                                    n: int,
+                                    directions: Union[ApproachDirection, List[ApproachDirection]] = None,
+                                    vertical_alignment: Optional[VerticalAlignment] = None,
+                                    arm: Arms = Arms.RIGHT,
+                                    target_object=None) -> List[Dict]:
+        """
+        Get n best reachable grasps sorted by score
+
+        Args:
+            n: Number of best grasps to return
+            directions: Approach direction(s) to filter by (if None, uses all directions)
+            vertical_alignment: Vertical alignment to filter by (if None, uses all alignments)
+            arm: Robot arm to check reachability for
+            target_object: Target object for additional validation?
+
+        Returns:
+            List of grasp dictionaries with pose, description, and reachability info
+        """
+        # Determine which directions to consider
+        if directions is None:
+            search_directions = list(ApproachDirection)
+        elif isinstance(directions, ApproachDirection):
+            search_directions = [directions]
+        else:
+            search_directions = directions
+
+        # Collect all candidate grasps
+        candidate_grasps = []
+        for direction in search_directions:
+            grasps = self.classified_grasps.get(direction, [])
+
+            # Filter by vertical alignment if specified
+            if vertical_alignment:
+                grasps = [g for g in grasps if g['vertical_alignment'] == vertical_alignment]
+
+            candidate_grasps.extend(grasps)
+
+        if not candidate_grasps:
+            return []
+
+        # Validate reachability and enrich grasp info
+        reachable_grasps = []
+        for grasp in candidate_grasps:
+            # Check reachability
+            is_reachable = self.validate_grasp_reachability(grasp['pose'], arm)
+
+            if is_reachable:
+                # Create enriched grasp info
+                enriched_grasp = {
+                    'id': grasp['id'],
+                    'pose': grasp['pose'],
+                    'score': grasp['score'],
+                    'approach_direction': grasp['approach_direction'],
+                    'vertical_alignment': grasp['vertical_alignment'],
+                    'grasp_description': GraspDescription(
+                        approach_direction=grasp['approach_direction'],
+                        vertical_alignment=grasp['vertical_alignment']
+                    )
+                }
+
+                reachable_grasps.append(enriched_grasp)
+
+        # Sort by score (descending) and return top n
+        reachable_grasps.sort(key=lambda x: x['score'], reverse=True)
+
+        return reachable_grasps[:n]
 
     def update_scores(self, scoring_function):
         """Update grasp scores using custom scoring function"""
