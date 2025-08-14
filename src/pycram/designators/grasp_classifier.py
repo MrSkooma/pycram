@@ -2,7 +2,7 @@ import numpy as np
 from typing import Dict, List, Optional, Union, Any
 from scipy.spatial.transform import Rotation
 
-from pycram.datastructures.pose import Pose, Vector3, Quaternion, GraspPose
+from pycram.datastructures.pose import PoseStamped, Vector3, Quaternion, GraspPose
 from pycram.datastructures.grasp import GraspDescription
 from pycram.datastructures.enums import ApproachDirection, VerticalAlignment, Arms
 from pycram.external_interfaces.ik import try_to_reach_with_grasp
@@ -42,21 +42,21 @@ class GraspClassifier:
 
         return classified
 
-    def _create_pose(self, grasp_data: Dict) -> Pose:
-        position = Vector3(
-            x=grasp_data['position']['x'],
-            y=grasp_data['position']['y'],
-            z=grasp_data['position']['z']
-        )
-        orientation = Quaternion(
-            x=grasp_data['orientation']['x'],
-            y=grasp_data['orientation']['y'],
-            z=grasp_data['orientation']['z'],
-            w=grasp_data['orientation']['w']
-        )
-        return Pose(position=position, orientation=orientation)
+    def _create_pose(self, grasp_data: Dict) -> PoseStamped:
+        position = [
+            grasp_data['position']['x'],
+            grasp_data['position']['y'],
+            grasp_data['position']['z']
+        ]
+        orientation = [
+            grasp_data['orientation']['x'],
+            grasp_data['orientation']['y'],
+            grasp_data['orientation']['z'],
+            grasp_data['orientation']['w']
+        ]
+        return PoseStamped.from_list(position=position, orientation=orientation)
 
-    def _determine_approach_direction(self, pose: Pose) -> ApproachDirection:
+    def _determine_approach_direction(self, pose: PoseStamped) -> ApproachDirection:
         """Determine approach direction from pose orientation"""
         quat = [pose.orientation.x, pose.orientation.y,
                 pose.orientation.z, pose.orientation.w]
@@ -72,7 +72,7 @@ class GraspClassifier:
             return ApproachDirection.BACK if approach_vector[1] < 0 else ApproachDirection.FRONT
 
 
-    def _determine_vertical_alignment(self, pose: Pose) -> VerticalAlignment:
+    def _determine_vertical_alignment(self, pose: PoseStamped) -> VerticalAlignment:
         """Determine vertical alignment from pose"""
         quat = [pose.orientation.x, pose.orientation.y,
                 pose.orientation.z, pose.orientation.w]
@@ -84,14 +84,19 @@ class GraspClassifier:
         elif up_vector[2] <= -0.5:
             return VerticalAlignment.BOTTOM
 
-    def validate_grasp_reachability(self, pose: Pose, arm: Arms) -> bool:
+    def validate_grasp_reachability(self, pose: PoseStamped, arm: Arms) -> bool:
         """Check if grasp pose is kinematically reachable"""
         if not self.robot:
             return False
 
         gripper_name = "r_gripper_tool_frame" if arm == Arms.RIGHT else "l_gripper_tool_frame"
         result_pose = try_to_reach_with_grasp(
-            pose, self.robot, gripper_name, pose.orientation
+            pose, self.robot, gripper_name, [
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w
+                ]
         )
         return result_pose is not None
 
