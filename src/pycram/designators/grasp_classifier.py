@@ -1,7 +1,10 @@
 import numpy as np
 from typing import Dict, List, Optional, Union, Any
+
+from mercurial.smartset import filteredset
 from scipy.spatial.transform import Rotation
 
+from pycram import tf_transformations
 from pycram.datastructures.pose import PoseStamped, Vector3, Quaternion, GraspPose
 from pycram.datastructures.grasp import GraspDescription
 from pycram.datastructures.enums import ApproachDirection, VerticalAlignment, Arms
@@ -136,12 +139,54 @@ class GraspClassifier:
             'id': best_grasp['id']
         }
 
-    def get_n_best_reachable_grasps(self,
-                                    n: int,
-                                    directions: Union[ApproachDirection, List[ApproachDirection]] = None,
-                                    vertical_alignment: Optional[VerticalAlignment] = None,
-                                    arm: Arms = Arms.RIGHT,
-                                    target_object=None) -> List[Dict]:
+    def _normalize_quaternion(self, q):
+        q = np.array(q, dtype=float)
+        n = np.linalg.norm(q)
+        return (q / n).tolist() if n > 0 else [0, 0, 0, 1]
+
+    def relative_gripper_pose_to_world(self, object_frame_world: PoseStamped,
+                                       gripper_frame_object: PoseStamped) -> PoseStamped:
+        """
+        Convert gripper pose expressed in object frame to world frame.
+
+        Inputs:
+          object_frame_world: PoseStamped (frame: world) -> T_world_object
+          gripper_frame_object: PoseStamped (frame: object) -> T_object_gripper
+
+        Output:
+          PoseStamped (frame: world) -> T_world_gripper
+
+        Math:
+          q_world_gripper = q_world_object * q_object_gripper
+          p_world_gripper = p_world_object + R(q_world_object) * p_object_gripper
+        """
+
+        # Object quaternion
+        q_obj = object_frame_world.orientation.to_list()
+        # Relative (object->gripper) quaternion
+        q_grip = gripper_frame_object.orientation.to_list()
+
+        r_obj = tf_transformations.quaternion_matrix(q_obj)[:3, :3]
+
+        # Relative translation (object frame)
+        t_grip = gripper_frame_object.position.to_list()
+
+        # World translation
+        t_world = object_frame_world.position.to_numpy() + np.dot(r_obj, t_grip)
+
+        # Compose quaternions (world_object * object_gripper)
+        q_world = tf_transformations.quaternion_multiply(q_obj, q_grip)
+        q_world = self._normalize_quaternion(q_world)
+
+        return PoseStamped().from_list(t_world.tolist(), q_world, object_frame_world.header.frame_id)
+
+    def get_n_best_grasps(self,
+                          n: int,
+                          directions: Union[ApproachDirection, List[ApproachDirection]] = None,
+                          vertical_alignment: Optional[VerticalAlignment] = None,
+                          arm: Arms = Arms.RIGHT,
+                          target_object=None,
+                          object_world_pose: PoseStamped = None) -> List[Dict]:
         """
         Get n best reachable grasps sorted by score
 
@@ -150,7 +195,9 @@ class GraspClassifier:
             directions: Approach direction(s) to filter by (if None, uses all directions)
             vertical_alignment: Vertical alignment to filter by (if None, uses all alignments)
             arm: Robot arm to check reachability for
-            target_object: Target object for additional validation?
+            target_object: Target object for additional validation??
+            object_world_pose: Pose of the target object in world frame (needed for reachability)
+                               reachability validation will be skipped if None
 
         Returns:
             List of grasp dictionaries with pose, description, and reachability info
@@ -164,7 +211,7 @@ class GraspClassifier:
             search_directions = directions
 
         # Collect all candidate grasps
-        candidate_grasps = []
+        candidate = []
         for direction in search_directions:
             grasps = self.classified_grasps.get(direction, [])
 
@@ -172,40 +219,40 @@ class GraspClassifier:
             if vertical_alignment:
                 grasps = [g for g in grasps if g['vertical_alignment'] == vertical_alignment]
 
-            candidate_grasps.extend(grasps)
+            candidate.extend(grasps)
 
-        if not candidate_grasps:
+        if not candidate:
             return []
 
         # Validate reachability and enrich grasp info
-        reachable_grasps = []
-        for grasp in candidate_grasps:
-            # Check reachability
-            is_reachable = self.validate_grasp_reachability(grasp['pose'], arm)
+        filtered_grasps = []
+        for grasp in candidate:
+            enriched_grasp = {
+                'id': grasp['id'],
+                'pose_relative': grasp['pose'],
+                'approach_direction': grasp['approach_direction'],
+                'vertical_alignment': grasp['vertical_alignment'],
+                'score': grasp['score']
+            }
 
-            if is_reachable:
-                # Create enriched grasp info
-                enriched_grasp = {
-                    'id': grasp['id'],
-                    'pose': grasp['pose'],
-                    'score': grasp['score'],
-                    'approach_direction': grasp['approach_direction'],
-                    'vertical_alignment': grasp['vertical_alignment'],
-                    'grasp_description': GraspDescription(
-                        approach_direction=grasp['approach_direction'],
-                        vertical_alignment=grasp['vertical_alignment']
-                    )
-                }
+            # Reachability check
+            if object_world_pose is not None:
+                pose_world = self.relative_gripper_pose_to_world(object_world_pose, grasp['pose'])
 
-                reachable_grasps.append(enriched_grasp)
+                if self.validate_grasp_reachability(pose_world, arm):
+                    # add world pose to grasp info, which is reachable
+                    enriched_grasp['pose_world'] = pose_world
+
+            filtered_grasps.append(enriched_grasp)
 
         # Sort by score (descending) and return top n
-        reachable_grasps.sort(key=lambda x: x['score'], reverse=True)
+        filtered_grasps.sort(key=lambda x: x['score'], reverse=True)
 
-        return reachable_grasps[:n]
+        return filtered_grasps[:n]
 
     def update_scores(self, scoring_function):
         """Update grasp scores using custom scoring function"""
         for direction, grasps in self.classified_grasps.items():
             for grasp in grasps:
                 grasp['score'] = scoring_function(grasp)
+
